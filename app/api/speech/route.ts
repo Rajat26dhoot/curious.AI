@@ -1,9 +1,8 @@
-import { NextResponse } from "next/server";
 import { fal } from "@fal-ai/client";
-import { getServerSession } from "next-auth";
+import { NextResponse } from "next/server";
 
-import { NEXT_AUTH_CONFIG } from "@/packages/api/nextAuthConfig";
 import prismadb from "@/packages/api/prismadb";
+import { requireSessionAccess } from "@/lib/server/app-session";
 
 fal.config({
   credentials: process.env.FAL_AI_API_KEY,
@@ -11,16 +10,18 @@ fal.config({
 
 export async function GET() {
   try {
-    const session = await getServerSession(NEXT_AUTH_CONFIG);
-    const userId = session?.user?.id;
+    const access = await requireSessionAccess({
+      guestMessage:
+        "Speech generation history is only available for registered accounts.",
+    });
 
-    if (!userId) {
-      return new NextResponse("Unauthorized", { status: 401 });
+    if (!access.ok) {
+      return access.response;
     }
 
     const history = await prismadb.speech.findMany({
       where: {
-        userId,
+        userId: access.userId,
       },
       orderBy: {
         createdAt: "desc",
@@ -36,14 +37,17 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
-    const session = await getServerSession(NEXT_AUTH_CONFIG);
-    const userId = session?.user?.id;
+    const access = await requireSessionAccess({
+      guestMessage:
+        "Speech generation is only available for registered accounts.",
+    });
+
+    if (!access.ok) {
+      return access.response;
+    }
+
     const { text, voicePreset } = await req.json();
     const prompt = typeof text === "string" ? text.trim() : "";
-
-    if (!userId) {
-      return new NextResponse("Unauthorized", { status: 401 });
-    }
 
     if (!prompt) {
       return NextResponse.json({ error: "Text is required" }, { status: 400 });
@@ -72,7 +76,7 @@ export async function POST(req: Request) {
 
     const interaction = await prismadb.speech.create({
       data: {
-        userId,
+        userId: access.userId,
         prompt,
         audioUrl: result.data.audio.url,
         voicePreset,

@@ -37,6 +37,8 @@ import {
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { VOICE_PRESETS, VoiceGender } from "@/lib/voice_presets";
 import { SpeechHistorySidebar } from "@/components/sidebar/speech-history-sidebar";
+import { useGuestSession } from "@/hooks/useGuestSession";
+import { GuestFeatureGate } from "@/components/guest/guest-feature-gate";
 
 type SpeechHistoryItem = {
   id: string;
@@ -92,6 +94,7 @@ const formSchema = z.object({
 });
 
 const SpeechPage = () => {
+  const { isGuest } = useGuestSession();
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [history, setHistory] = useState<SpeechHistoryItem[]>([]);
   const [hasFetchedHistory, setHasFetchedHistory] = useState(false);
@@ -202,6 +205,19 @@ const SpeechPage = () => {
       setIsLoading(false);
     }
   };
+
+  if (isGuest) {
+    return (
+      <GuestFeatureGate
+        title="Speech Studio is unlocked after sign up"
+        description="Guest mode lets people explore chat and code, while voice generation and saved audio history stay reserved for registered accounts."
+        details={[
+          "Speech runs on cloud-backed generation and saves audio outputs to your account history.",
+          "Create an account to generate voiceovers, reopen them later, and export audio reliably.",
+        ]}
+      />
+    );
+  }
 
   return (
     <main className="relative h-full overflow-hidden px-3 py-4 md:px-6 md:py-6">

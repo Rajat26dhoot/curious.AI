@@ -33,6 +33,8 @@ import {
   type ConversationMessage,
 } from "@/lib/chat";
 import BotAvatar from "@/components/extra/bot.avatar";
+import { useGuestSession } from "@/hooks/useGuestSession";
+import { GuestFeatureGate } from "@/components/guest/guest-feature-gate";
 
 const chatBootstrapKey = (chatId: string) => `chat-bootstrap:${chatId}`;
 const MAX_ATTACHMENT_SIZE_LABEL = `${
@@ -59,6 +61,7 @@ const readFileAsDataUrl = (file: File) =>
 export default function ConversationPage() {
   const router = useRouter();
   const params = useParams();
+  const { isGuest } = useGuestSession();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const rawId = params.id;
   const id = Array.isArray(rawId) ? rawId[0] : rawId;
@@ -126,6 +129,19 @@ export default function ConversationPage() {
   const isLoading = form.formState.isSubmitting;
   const promptValue = form.watch("prompt") || "";
   const canSend = Boolean(promptValue.trim() || selectedImage);
+
+  if (isGuest) {
+    return (
+      <GuestFeatureGate
+        title="Saved chat threads require an account"
+        description="Guest conversations stay local to this browser, so direct thread URLs and cloud history open up after you sign in."
+        details={[
+          "Use the main chat screen in guest mode for local-only conversations.",
+          "Create an account to keep named threads, reopen them later, and share your history across sessions.",
+        ]}
+      />
+    );
+  }
 
   const handleImageSelection = async (
     event: ChangeEvent<HTMLInputElement>

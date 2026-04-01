@@ -1,9 +1,7 @@
-﻿import { getServerSession } from "next-auth";
 import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
+
 import prismadb from "@/packages/api/prismadb";
-import { NEXT_AUTH_CONFIG } from "@/packages/api/nextAuthConfig";
-import { generateAndStoreImage } from "@/lib/server/generate-image";
 import {
   extractEmbeddedImages,
   hasEmbeddedImage,
@@ -12,6 +10,8 @@ import {
   stripEmbeddedImages,
   type ConversationMessage,
 } from "@/lib/chat";
+import { requireSessionAccess } from "@/lib/server/app-session";
+import { generateAndStoreImage } from "@/lib/server/generate-image";
 
 const GROQ_API_KEY =
   process.env.EXPO_PUBLIC_GROQ_API_KEY || process.env.GROQ_API_KEY || "";
@@ -50,7 +50,10 @@ function hasMarkdownImage(input: string): boolean {
 function sanitizeForTitle(input: string): string {
   return input
     .replace(/!\[[^\]]*\]\((?:data:image|https?:\/\/)[^)]+\)/gi, "[image]")
-    .replace(/data:image\/[a-zA-Z+.-]+;base64,[a-zA-Z0-9+/=]+/g, "[base64-image]")
+    .replace(
+      /data:image\/[a-zA-Z+.-]+;base64,[a-zA-Z0-9+/=]+/g,
+      "[base64-image]"
+    )
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 500);
@@ -150,7 +153,10 @@ function buildGroqMessages(messages: ConversationMessage[]) {
     if (message.role === "user") {
       return {
         role: message.role,
-        content: buildUserMessageContent(message.content, allowedImageCounts[index]),
+        content: buildUserMessageContent(
+          message.content,
+          allowedImageCounts[index]
+        ),
       };
     }
 
@@ -161,22 +167,20 @@ function buildGroqMessages(messages: ConversationMessage[]) {
   });
 }
 
-async function seedChats(groupChatId: string) {
-  try {
-    const response = await prismadb.groupChat.findFirst({
-      where: { id: groupChatId },
-      include: { chats: true },
-    });
+async function seedChats(groupChatId: string, userId: string) {
+  const response = await prismadb.groupChat.findFirst({
+    where: { id: groupChatId, userId },
+    include: { chats: true },
+  });
 
-    const previousChats = response?.chats || [];
-    return previousChats.flatMap((entry: Pick<Chat, "prompt" | "response">) => [
-      { role: "user" as const, content: entry.prompt },
-      { role: "assistant" as const, content: String(entry.response) },
-    ]);
-  } catch (error) {
-    console.log(error);
-    return [];
+  if (!response) {
+    return null;
   }
+
+  return response.chats.flatMap((entry: Pick<Chat, "prompt" | "response">) => [
+    { role: "user" as const, content: entry.prompt },
+    { role: "assistant" as const, content: String(entry.response) },
+  ]);
 }
 
 export async function POST(req: Request) {
@@ -185,8 +189,7 @@ export async function POST(req: Request) {
       return new NextResponse("Missing Groq API key", { status: 500 });
     }
 
-    const session = await getServerSession(NEXT_AUTH_CONFIG!);
-    const userId = session?.user?.id;
+    const access = await requireSessionAccess({ allowGuest: true });
     const body = await req.json();
     let groupChatId =
       typeof body?.groupChatId === "string" ? body.groupChatId : "";
@@ -194,20 +197,45 @@ export async function POST(req: Request) {
     const isIncognito = Boolean(body?.incognito);
     const clientMessages = parseClientMessages(body?.messages);
 
-    if (!userId) {
-      return new NextResponse("Unauthorized", { status: 401 });
+    if (!access.ok) {
+      return access.response;
     }
 
     if (!prompt) {
       return new NextResponse("prompt is required", { status: 400 });
     }
 
-    const previousMessages =
-      isIncognito && clientMessages.length > 0
-        ? clientMessages
-        : groupChatId
-        ? await seedChats(groupChatId)
-        : [];
+    if (groupChatId && !isIncognito && access.isGuest) {
+      return NextResponse.json(
+        {
+          code: "GUEST_UPGRADE_REQUIRED",
+          message:
+            "Guest conversations stay local to this browser. Create an account to save threaded chat history.",
+        },
+        { status: 403 }
+      );
+    }
+
+    let previousMessages: ConversationMessage[] = [];
+
+    if (isIncognito && clientMessages.length > 0) {
+      previousMessages = clientMessages;
+    } else if (groupChatId) {
+      const storedMessages = await seedChats(groupChatId, access.userId);
+
+      if (!storedMessages) {
+        return NextResponse.json(
+          {
+            code: "CHAT_NOT_FOUND",
+            message: "We could not find that chat thread.",
+          },
+          { status: 404 }
+        );
+      }
+
+      previousMessages = storedMessages;
+    }
+
     const userMessage = { role: "user" as const, content: prompt };
     const baseMessages = [...previousMessages, userMessage];
     const groqMessages = buildGroqMessages(baseMessages);
@@ -282,10 +310,12 @@ export async function POST(req: Request) {
             parsedArgs.prompt?.trim() ||
             promptText ||
             "Create an image based on the user's request.";
+
           try {
             const imageUrl = await generateAndStoreImage({
               prompt: toolPrompt,
-              userId,
+              userId: access.userId,
+              persist: !access.isGuest,
             });
             generatedImages.push({ imageUrl, prompt: toolPrompt });
 
@@ -355,7 +385,8 @@ export async function POST(req: Request) {
       try {
         const imageUrl = await generateAndStoreImage({
           prompt: promptText || prompt,
-          userId,
+          userId: access.userId,
+          persist: !access.isGuest,
         });
         response = `![Generated image](${imageUrl})`;
       } catch (fallbackError) {
@@ -367,7 +398,7 @@ export async function POST(req: Request) {
       }
     }
 
-    if (!isIncognito) {
+    if (!isIncognito && !access.isGuest) {
       const chatData = {
         prompt,
         response: String(response),
@@ -402,7 +433,7 @@ export async function POST(req: Request) {
           data: {
             title: String(title),
             chats: { create: chatData },
-            userId,
+            userId: access.userId,
           },
         });
 

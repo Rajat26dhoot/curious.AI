@@ -8,7 +8,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { Form, FormControl, FormField, FormItem } from "@/components/ui/form";
 import { Button } from "@/components/ui/button";
 import { useRouter } from "next/navigation";
-import { ChangeEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import Loader from "@/components/loaders/loader";
 import { cn } from "@/lib/utils";
 import toast from "react-hot-toast";
@@ -28,6 +28,7 @@ import {
 import remarkGfm from "remark-gfm";
 import { HistorySidebar } from "@/components/sidebar/history-sidebar";
 import { ChatAttachmentPreview } from "@/components/chat/chat-attachment-preview";
+import { GuestHistorySidebar } from "@/components/guest/guest-history-sidebar";
 import {
   buildPromptWithAttachment,
   extractEmbeddedImages,
@@ -37,6 +38,17 @@ import {
   stripEmbeddedImages,
   type ConversationMessage,
 } from "@/lib/chat";
+import { useGuestSession } from "@/hooks/useGuestSession";
+import {
+  createGuestConversationTitle,
+  createGuestEntityId,
+  deleteGuestConversation,
+  ensureGuestStore,
+  getActiveGuestConversation,
+  saveGuestConversation,
+  setActiveGuestConversation,
+  type GuestChatConversation,
+} from "@/lib/guest-session";
 import BotAvatar from "@/components/extra/bot.avatar";
 
 const chatBootstrapKey = (chatId: string) => `chat-bootstrap:${chatId}`;
@@ -61,12 +73,21 @@ const readFileAsDataUrl = (file: File) =>
     reader.readAsDataURL(file);
   });
 
+const getRequestErrorMessage = (error: any, fallback: string) =>
+  error?.response?.data?.message || error?.response?.data || fallback;
+
 function ConversationPage() {
   const router = useRouter();
+  const { isGuest, guestId, guestExpiresAt } = useGuestSession();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [isIncognito, setIsIncognito] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [guestHistory, setGuestHistory] = useState<GuestChatConversation[]>([]);
+  const [activeGuestConversationId, setActiveGuestConversationId] = useState<
+    string | null
+  >(null);
+  const [isGuestHistoryOpen, setIsGuestHistoryOpen] = useState(false);
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -78,6 +99,7 @@ function ConversationPage() {
   const isLoading = form.formState.isSubmitting;
   const promptValue = form.watch("prompt") || "";
   const canSend = Boolean(promptValue.trim() || selectedImage);
+  const effectiveIncognito = isGuest || isIncognito;
 
   const suggestions = useMemo(
     () => [
@@ -112,6 +134,146 @@ function ConversationPage() {
     ],
     []
   );
+
+  useEffect(() => {
+    if (!isGuest || !guestId || !guestExpiresAt) {
+      return;
+    }
+
+    try {
+      const store = ensureGuestStore({
+        guestId,
+        expiresAt: guestExpiresAt,
+      });
+      const activeConversation = getActiveGuestConversation(store);
+
+      setGuestHistory(store.chats);
+      setActiveGuestConversationId(store.activeChatId);
+      setMessages(activeConversation?.messages || []);
+      setSelectedImage(null);
+    } catch (error) {
+      console.error("Failed to restore guest chat history.", error);
+      toast.error("We could not restore your local guest conversation.");
+    }
+  }, [guestExpiresAt, guestId, isGuest]);
+
+  const persistGuestConversation = (
+    nextMessages: ConversationMessage[],
+    seedPrompt: string
+  ) => {
+    if (!isGuest || !guestId || !guestExpiresAt) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const existingConversation = guestHistory.find(
+      (conversation) => conversation.id === activeGuestConversationId
+    );
+    const conversationId =
+      existingConversation?.id || `chat_${createGuestEntityId()}`;
+
+    try {
+      const store = saveGuestConversation(
+        {
+          guestId,
+          expiresAt: guestExpiresAt,
+        },
+        {
+          id: conversationId,
+          title:
+            existingConversation?.title || createGuestConversationTitle(seedPrompt),
+          messages: nextMessages,
+          createdAt: existingConversation?.createdAt || now,
+          updatedAt: now,
+        }
+      );
+
+      setGuestHistory(store.chats);
+      setActiveGuestConversationId(store.activeChatId);
+    } catch (error) {
+      console.error("Failed to save guest conversation locally.", error);
+      toast.error(
+        "We could not save this guest conversation locally. Keep this tab open to avoid losing it."
+      );
+    }
+  };
+
+  const handleSelectGuestConversation = (conversationId: string) => {
+    if (!isGuest || !guestId || !guestExpiresAt) {
+      return;
+    }
+
+    try {
+      const store = setActiveGuestConversation(
+        {
+          guestId,
+          expiresAt: guestExpiresAt,
+        },
+        conversationId
+      );
+      const activeConversation = getActiveGuestConversation(store);
+
+      setGuestHistory(store.chats);
+      setActiveGuestConversationId(store.activeChatId);
+      setMessages(activeConversation?.messages || []);
+      setSelectedImage(null);
+      form.reset({ prompt: "" });
+      setIsGuestHistoryOpen(false);
+    } catch (error) {
+      console.error("Failed to load guest conversation.", error);
+      toast.error("We could not load that guest conversation.");
+    }
+  };
+
+  const handleDeleteGuestConversation = (conversationId: string) => {
+    if (!isGuest || !guestId || !guestExpiresAt) {
+      return;
+    }
+
+    try {
+      const store = deleteGuestConversation(
+        {
+          guestId,
+          expiresAt: guestExpiresAt,
+        },
+        conversationId
+      );
+      const activeConversation = getActiveGuestConversation(store);
+
+      setGuestHistory(store.chats);
+      setActiveGuestConversationId(store.activeChatId);
+      setMessages(activeConversation?.messages || []);
+    } catch (error) {
+      console.error("Failed to delete guest conversation.", error);
+      toast.error("We could not remove that guest conversation.");
+    }
+  };
+
+  const handleNewGuestConversation = () => {
+    setMessages([]);
+    setSelectedImage(null);
+    form.reset({ prompt: "" });
+
+    if (!isGuest || !guestId || !guestExpiresAt) {
+      return;
+    }
+
+    try {
+      const store = setActiveGuestConversation(
+        {
+          guestId,
+          expiresAt: guestExpiresAt,
+        },
+        null
+      );
+
+      setGuestHistory(store.chats);
+      setActiveGuestConversationId(null);
+      setIsGuestHistoryOpen(false);
+    } catch (error) {
+      console.error("Failed to start a new guest conversation.", error);
+    }
+  };
 
   const handleImageSelection = async (
     event: ChangeEvent<HTMLInputElement>
@@ -159,8 +321,8 @@ function ConversationPage() {
 
       const response = await axios.post("/api/chat", {
         prompt,
-        messages: isIncognito ? messages : undefined,
-        incognito: isIncognito,
+        messages: effectiveIncognito ? messages : undefined,
+        incognito: effectiveIncognito,
       });
 
       const newMessage: ConversationMessage = {
@@ -169,11 +331,17 @@ function ConversationPage() {
       };
 
       const nextMessages = [userMessage, newMessage];
-      setMessages((current) => [...current, ...nextMessages]);
+      const updatedMessages = [...messages, ...nextMessages];
+      setMessages(updatedMessages);
       form.reset({ prompt: "" });
       setSelectedImage(null);
 
-      if (!isIncognito && response.data.groupChatId) {
+      if (isGuest) {
+        persistGuestConversation(updatedMessages, prompt);
+        return;
+      }
+
+      if (!effectiveIncognito && response.data.groupChatId) {
         const groupChatId = String(response.data.groupChatId);
 
         try {
@@ -189,7 +357,14 @@ function ConversationPage() {
       }
     } catch (error: any) {
       console.log(error);
-      toast.error("Something went wrong.");
+
+      if (error?.response?.data?.code === "GUEST_SESSION_EXPIRED") {
+        toast.error("Your guest session expired. Sign in to continue.");
+        router.push("/signin?guestExpired=1");
+        return;
+      }
+
+      toast.error(getRequestErrorMessage(error, "Something went wrong."));
     }
   };
 
@@ -214,29 +389,56 @@ function ConversationPage() {
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setIsIncognito((current) => !current)}
-                className={cn(
-                  "inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm",
-                  isIncognito
-                    ? "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-400/40 dark:bg-amber-400/10 dark:text-amber-100 dark:hover:bg-amber-400/20"
-                    : "border-slate-200 bg-white/90 text-slate-700 hover:bg-slate-100 dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
-                )}
-              >
-                {isIncognito ? (
-                  <EyeOff className="h-4 w-4" />
-                ) : (
-                  <Eye className="h-4 w-4" />
-                )}
-                <span>{isIncognito ? "Incognito On" : "Incognito Off"}</span>
-              </Button>
-              <HistorySidebar />
+              {isGuest ? (
+                <>
+                  <div className="rounded-lg border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-400/40 dark:bg-amber-400/10 dark:text-amber-100">
+                    Guest mode keeps chat local to this browser.
+                  </div>
+                  <GuestHistorySidebar
+                    history={guestHistory}
+                    activeConversationId={activeGuestConversationId}
+                    isOpen={isGuestHistoryOpen}
+                    onToggle={() => setIsGuestHistoryOpen((current) => !current)}
+                    onSelect={handleSelectGuestConversation}
+                    onDelete={handleDeleteGuestConversation}
+                    onNewChat={handleNewGuestConversation}
+                  />
+                </>
+              ) : (
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setIsIncognito((current) => !current)}
+                    className={cn(
+                      "inline-flex h-10 items-center gap-2 rounded-lg border px-3 text-sm",
+                      isIncognito
+                        ? "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100 dark:border-amber-400/40 dark:bg-amber-400/10 dark:text-amber-100 dark:hover:bg-amber-400/20"
+                        : "border-slate-200 bg-white/90 text-slate-700 hover:bg-slate-100 dark:border-white/15 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                    )}
+                  >
+                    {isIncognito ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                    <span>{isIncognito ? "Incognito On" : "Incognito Off"}</span>
+                  </Button>
+                  <HistorySidebar />
+                </>
+              )}
             </div>
           </header>
 
           <div className="flex-1 overflow-y-auto px-3 py-4 md:px-6">
+            {isGuest ? (
+              <div className="mx-auto mb-4 max-w-4xl rounded-2xl border border-cyan-200/80 bg-cyan-50/80 px-4 py-3 text-xs text-cyan-900 dark:border-cyan-400/20 dark:bg-cyan-400/10 dark:text-cyan-100 md:text-sm">
+                Guest chats are stored locally for a limited time. Uploaded images
+                and generated image outputs may be omitted if browser storage is
+                interrupted or reaches its limit.
+              </div>
+            ) : null}
+
             {messages.length === 0 ? (
               <div className="mx-auto mt-24 w-full max-w-lg text-center">
                 <h2 className="text-xl font-semibold text-slate-900 dark:text-white md:text-2xl">
@@ -359,9 +561,11 @@ function ConversationPage() {
           </div>
 
           <div className="sticky bottom-0 border-t border-slate-200/70 bg-white/80 p-3 backdrop-blur-xl dark:border-white/10 dark:bg-black/80 md:p-4">
-            {isIncognito ? (
+            {effectiveIncognito ? (
               <p className="mx-auto mb-2 w-full max-w-4xl rounded-lg border border-amber-300/70 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-400/40 dark:bg-amber-400/10 dark:text-amber-100">
-                Incognito mode is active. This chat is not saved and will not appear in history.
+                {isGuest
+                  ? "Guest mode saves only compact local chat data on this device for a limited time."
+                  : "Incognito mode is active. This chat is not saved and will not appear in history."}
               </p>
             ) : null}
 
